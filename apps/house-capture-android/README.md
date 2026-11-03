@@ -33,7 +33,7 @@ in your fork at the commit you reviewed, then install `app-debug.apk`
 (`adb install app-debug.apk`). Debug builds allow debugging and are intended for testing.
 
 Locally, open `apps/house-capture-android` in Android Studio, or install JDK 17 and
-Android SDK platform 35 / Build Tools 34.0.0, set `ANDROID_HOME` to that SDK, and run:
+Android SDK platform 35 / Build Tools 35.0.0, set `ANDROID_HOME` to that SDK, and run:
 
 ```sh
 cd apps/house-capture-android
@@ -47,7 +47,7 @@ and checksums against [Gradle's releases](https://gradle.org/releases/) first.
 The project does not yet provide a fully reviewed transitive dependency lock or
 Gradle dependency-verification metadata; the wrapper checksum covers Gradle itself.
 
-Toolchain: Gradle 8.14.6, AGP 8.7.3, Kotlin 2.0.21, Compose BOM 2024.12.01, ARCore 1.57.0, compile/target SDK 35,
+Toolchain: Gradle 8.14.6, AGP 8.13.2, Kotlin 2.0.21, Compose BOM 2024.12.01, ARCore 1.57.0, compile/target SDK 35,
 min SDK 29. JVM unit tests (`app/src/test`) cover the bundle JSON, matrices, depth encoding, the
 fallback layout, depth/pose pairing, the scan hints and the room verdict.
 

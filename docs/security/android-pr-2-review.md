@@ -50,6 +50,8 @@ Severity below reflects the stated preconditions and this personal capture/impor
 | PY-03 | Medium | Compressed depth and metadata-derived allocations lack useful bounds | New synthesis script; unbounded depth inflate also inherited in reconstruction | Exact bounded DEFLATE, dimensional/aggregate limits, pose and geometry validation, bounded PLY parsing and grids |
 | AND-01 | Medium privacy | Deleting a room leaves complete exported ZIP copies in app cache | New Android application | Session-associated export cleanup, URI revocation, checked deletion, visible errors |
 | BUILD-01 | High published advisories | Gradle 8.9 is within affected version ranges | New Android build instructions/workflow | Verified Gradle 8.14.6 wrapper/distribution |
+| BUILD-02 | High Protobuf / low Commons IO publisher ratings; build-input dependent | AGP 8.7.3 selects affected Protobuf and Commons IO parsers | New Android build toolchain | AGP 8.13.2 selects patched Protobuf 3.25.5 and Commons IO 2.16.1 |
+| BUILD-03 | Residual dependency maintenance | Other selected build libraries still match advisories | New Android build toolchain | Assessed task/configuration boundaries below; not claimed universally fixed |
 | AND-02 | Low, conditional | `allowBackup=false` alone does not express an Android 12+ device-transfer exclusion | New Android configuration | Explicit cloud-backup and device-transfer exclusions |
 | CI-01 | Hardening | Mutable action tags, checkout credentials, unpinned Python packages; Pages build shares deploy privileges | Mixed new and inherited configuration | SHA pins, no persisted checkout credential, hash-pinned CI wheels, separate build/deploy permissions |
 | RELEASE-01 | Release gate | Published artifact is a debug APK | Intentional upstream CI behavior | Build and inspect unsigned release separately; sign locally before ordinary private use |
@@ -98,6 +100,12 @@ The candidate uses Gradle 8.14.6 with a committed wrapper, verifies the wrapper 
 
 The official downloaded distribution was checked against the publisher's checksum. The wrapper JAR also matched the published SHA-256 `ad16bca46cb71bb5887c546860d93992aeee35c1fdaf4a242b0a612375d937e0`. `--no-daemon` alone is not treated as a security fix because Gradle may still create a single-use daemon for the requested JVM settings. Full dependency verification for every resolved Maven artifact remains a separate task; collecting first-seen hashes would not independently establish provenance.
 
+### BUILD-02: Update the Android plugin's affected build parsers
+
+Resolving the actual project showed AGP 8.7.3 selecting Protobuf Java 3.22.3 and Commons IO 2.13.0. Protobuf parses build resource metadata, making its malformed-input handling a meaningful build-side boundary. The [Protobuf maintainer advisory](https://github.com/protocolbuffers/protobuf/security/advisories/GHSA-735f-pc8j-v9w8) identifies a parsing denial of service and lists 3.25.5 among its fixes. [Apache's advisory](https://commons.apache.org/proper/commons-io/security.html) identifies excessive CPU consumption in the older XML stream reader and fixes it in 2.14.0; Apache rates that issue low, despite some database ratings being higher.
+
+The candidate updates the Android Gradle Plugin to 8.13.2, which selects Protobuf 3.25.5 and Commons IO 2.16.1. This is a plugin update rather than forced overrides of individual transitive libraries. Google's [compatibility table](https://developer.android.com/build/releases/agp-8-13-0-release-notes) specifies Gradle 8.13 or newer, JDK 17 and Build Tools 35.0.0; the candidate's Gradle 8.14.6 meets that minimum and the README now specifies Build Tools 35. Both APK variants and the full JVM suite are required in CI after the update.
+
 ### AND-02: Android transfer behavior needs an explicit policy
 
 The app disables backup, but captures live in normal application files. [Android's documentation](https://developer.android.com/about/versions/12/behavior-changes-12#backup-restore) states that some Android 12+ manufacturers still permit device-to-device transfer when `allowBackup=false`. The candidate adds explicit cloud-backup and device-transfer exclusions for the `filesDir` domain containing captures while retaining `allowBackup=false`. Future storage domains would require their own policy review.
@@ -128,7 +136,25 @@ These observations concern the reviewed application. They do not certify Google 
 
 An advisory lookup covered 53 identifiable Maven coordinates recovered from APK version markers and the declared build/runtime coordinates. No listed advisory was returned for those 53 runtime queries. Version markers are an incomplete inventory, and a clean query is not proof of safety.
 
-Fresh Gradle resolution subsequently exposed additional advisory matches among 205 observed build-cache coordinates, including older Android build-tool transitives. A cache can contain unselected versions, and a coordinate match does not establish that the affected operation is used. Selection and applicability analysis is still a gate for this draft candidate; it must not be described as a clean bill of health for the Android build dependency graph.
+The initial build-cache scan was followed by actual Gradle selection reports. With AGP 8.7.3, the project selected 149 build coordinates, of which 15 matched 59 distinct advisory IDs; its 97 release-runtime coordinates returned no OSV matches. The [baseline dependency inventory](android-dependency-scan-2026-11-03.json) records those exact queries. The candidate's AGP 8.13.2 selection was resolved separately, including the existing Kotlin plugins: 152 build coordinates, 13 matched coordinates and 48 distinct IDs. The 97 release-runtime coordinate/version pairs are unchanged and still returned no listed matches. The [updated inventory](android-dependency-scan-agp8.13.2-2026-11-03.json) records the queries and catalog hash. These are scanner/version matches, not a count of demonstrated exploitable flaws in the app.
+
+### BUILD-03: Residual build dependencies and applicability
+
+The AGP update does not eliminate every advisory match. Exact cached AGP artifacts and the reviewed source paths support the following limited conclusions for the commands used here:
+
+| Remaining component/family | Observed use or precondition | Disposition for this workflow |
+| --- | --- | --- |
+| Netty 4.1.110.Final / gRPC | UTP result listener for device and managed-device instrumentation tests; generated certificates, mandatory client authentication, `forPort` binding without an explicit loopback address | JVM unit tests and APK assembly do not request that task. No demonstrated activation of the affected server path by these commands. Do not extend that conclusion to instrumentation testing or describe the listener as loopback-only. |
+| JDOM 2.0.6 | Jetifier contains a relevant XML parser, but Jetifier defaults to false and is not enabled in this project | Affected operation exists in the tooling; the required feature is disabled here. Reassess before enabling Jetifier. |
+| Commons Compress 1.21 | Reviewed SDK installer consumers use ZIP APIs; the matched advisories concern DUMP/Pack200 processing | Those affected format paths were not found in the reviewed operations. Keep the library maintenance issue open. |
+| jose4j 0.9.5 | Bundletool uses JWS code-transparency operations; the matched path concerns JWE decryption/decompression | No demonstrated use of the affected operation in unit tests or debug/unsigned-release assembly. |
+| Bouncy Castle 1.79 | Reviewed build paths create local RSA/SHA256 certificates; matched issues involve other algorithms, validation, CRL/LDAP or composite-signature paths | No demonstrated affected path in the reviewed build operations. This is not a review of every signing/crypto feature. |
+| Guava 33.3.1-jre | The [publisher advisory](https://github.com/google/guava/security/advisories/GHSA-xxph-c9ww-hj94) concerns native Java deserialization of particular collections | No hostile object-stream entry point to those collection readers was demonstrated here. The library still matches the advisory; Google rates it moderate. |
+| Kotlin Gradle plugin 2.0.21 | KAPT incremental-cache deserialization | KAPT is not applied; details below. |
+
+Netty remains old enough for later [HTTP/2 advisories](https://github.com/netty/netty/security/advisories/GHSA-prj3-ccx8-p6x4); mandatory client authentication is a condition of the observed listener, not a universal patch for Netty. These findings justify continued toolchain maintenance and a new review when enabling additional build features. All listed families are absent from the selected application release runtime graph; `guava:listenablefuture` is a separate small runtime artifact, not the affected full Guava library.
+
+No reachable high/critical exploit was demonstrated in the reviewed JVM-test plus APK-assembly commands. That is a scoped assessment based on the observed tasks and configurations, not proof that every dependency method is unreachable or vulnerability-free. The project still lacks independently reviewed complete dependency verification/locking. Prefer a compatible supported toolchain update over arbitrary per-module overrides beneath AGP.
 
 Kotlin 2.0.21 matches the published affected version range for [GHSA-r937-wjx7-w2jp / CVE-2026-53914](https://github.com/advisories/GHSA-r937-wjx7-w2jp). The linked [official fix](https://github.com/JetBrains/kotlin/commit/bf51df665b458fda7c3eaf436c4d88dc119d7ec6) concerns KAPT incremental-cache deserialization. This project does not apply KAPT or declare annotation processors, so that specific vulnerable path was not shown to be active. It remains a dependency follow-up; the review does not claim the advisory is fixed or turn a version match into demonstrated APK compromise. A compatible stable Kotlin/Compose/toolchain update should be evaluated separately rather than blindly selecting the advisory's beta minimum.
 
@@ -137,6 +163,8 @@ The inspected upstream APK is `debuggable=true` and includes an exported Compose
 ## Verification and remaining gates
 
 The original Python suite passed all 15 tests before changes. The remediated suite passed 34 tests locally, including 19 new bounded security regressions. An independent follow-up review found no remaining blocker in the defensive corrections and reran all 19 security tests plus the 8 Android synthetic cases successfully. Existing synthetic-room tests still check four-wall geometry, door/window candidates, object candidates, the mesh schema and downstream conversion. This validates compatibility on generated fixtures, not physical scan accuracy.
+
+The first patched candidate, `487ab106b7a74321ad9f2624e2814c05ebb93ad7`, passed its [actual GitHub Android build](https://github.com/HunterGerlach/3d-model-anything/actions/runs/41718306576): 41 JVM tests, zero failures/errors/skips, debug assembly, unsigned release assembly, and the release-manifest gate. The test artifact and release archive matched GitHub's supplied SHA-256 digests. Independent inspection of the built release APK confirmed no INTERNET permission, no debuggable flag, no Compose preview activity, a non-exported FileProvider, `allowBackup=false`, and compiled cloud/transfer exclusions. Its [verification record](android-ci-verification-487ab10.json) includes hashes and test counts. That run used AGP 8.7.3; the subsequent 8.13.2 update is checked again by the same CI gates. See the [draft PR's current checks](https://github.com/HunterGerlach/3d-model-anything/pull/1/checks) for the exact final candidate result.
 
 Run the complete Python suite from the repository root:
 
@@ -150,7 +178,7 @@ Run the Android gates from `apps/house-capture-android` with the documented SDK 
 ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
 ```
 
-Final build/check outcomes are recorded with the candidate PR. Do not infer a successful patched build from the upstream run: that run proves only the original head passed its original jobs. The local environment had no Android SDK or Gradle initially; official tools were downloaded with checksum verification, and any local execution limitations must be distinguished from CI results.
+Final build/check outcomes are recorded with the candidate PR. Do not infer a successful patched build from the upstream run: that run proves only the original head passed its original jobs. The local environment initially had no Android SDK or Gradle and its Java runtime lacked a compiler, so the successful full compilation evidence comes from GitHub's JDK 17 runner. Official locally downloaded tooling was checksum-verified; local dependency selection and Python tests were separate from that full CI build.
 
 Before routine private-room use:
 
