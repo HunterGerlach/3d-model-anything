@@ -23,11 +23,17 @@
     <string name="delete">Delete</string>
     <string name="delete_room">Delete %1$s</string>
     <string name="delete_title">Delete %1$s?</string>
-    <string name="delete_body">Its photos, depth and room files are deleted from this phone. This cannot be undone.</string>
+    <string name="delete_body">Delete this app\'s photos, depth, room files and cached exports for this room? Copies already saved elsewhere remain. This cannot be undone.</string>
+    <string name="delete_failed_title">Couldn\'t delete the room</string>
+    <string name="delete_failed_body">Some local files may remain. Try deleting the room again.</string>
+    <string name="library_failed_title">Couldn\'t load rooms</string>
+    <string name="library_failed_body">Saved files could not be read or old exports could not be cleared. Try again.</string>
+    <string name="retry">Try again</string>
+    <string name="ok">OK</string>
     <string name="cancel">Cancel</string>
 
     <string name="camera_title">Camera access needed</string>
-    <string name="camera_body">Scanning uses the camera to track the phone and take photos. Nothing leaves the phone unless you share a room.</string>
+    <string name="camera_body">Scanning uses the camera to track the phone and take photos. Scans stay in this app\'s private storage until you choose to share them. Shared ZIPs include photos, room geometry and capture details.</string>
     <string name="open_settings">Open settings</string>
 
     <string name="back">Back</string>

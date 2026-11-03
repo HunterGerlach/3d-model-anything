@@ -33,7 +33,8 @@ class ScanBundle(val dir: File) {
     /** Writes through a temp file + rename, so a crash never leaves half a JSON file behind. */
     fun writeText(path: String, text: String) {
         val target = file(path)
-        target.parentFile?.mkdirs()
+        // create() makes the session's directories. A queued checkpoint must not recreate a room
+        // that the user deleted while the capture writer was finishing its last work.
         val temp = File(target.parentFile, ".${target.name}.tmp")
         temp.writeText(text)
         if (!temp.renameTo(target)) {

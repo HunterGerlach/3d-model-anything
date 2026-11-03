@@ -184,7 +184,7 @@ class AndroidBundleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
-        cls.base = Path(cls.temp.name)
+        cls.base = Path(cls.temp.name).resolve()
         cls.bundle = cls.base / 'bundle'
         build_bundle(cls.bundle)
         cls.raw = cls.base / 'raw'

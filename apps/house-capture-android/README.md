@@ -23,19 +23,31 @@ support the app still records photos and planes, but the offline synthesizer has
 ## Build
 
 The `Build Android app` workflow (`.github/workflows/android.yml`) runs the unit tests and
-`assembleDebug` on every push that touches this directory. Download the
-`house-capture-android-debug` artifact from the run and install `app-debug.apk`
-(`adb install app-debug.apk`).
+builds both the debug APK and an unsigned release APK on every push that touches this
+directory. It checks that the merged release manifest has no internet permission,
+debuggable application, or Compose preview activity. The unsigned release artifact is
+for inspection and needs your own signing setup before installation.
 
-Locally, open `apps/house-capture-android` in Android Studio, or (Gradle 8.9+ and JDK 17 installed):
+For a development test, download `house-capture-android-debug` from a successful run
+in your fork at the commit you reviewed, then install `app-debug.apk`
+(`adb install app-debug.apk`). Debug builds allow debugging and are intended for testing.
+
+Locally, open `apps/house-capture-android` in Android Studio, or install JDK 17 and
+Android SDK platform 35 / Build Tools 34.0.0, set `ANDROID_HOME` to that SDK, and run:
 
 ```sh
 cd apps/house-capture-android
-gradle wrapper --gradle-version 8.9      # once; the wrapper is not committed
-./gradlew testDebugUnitTest assembleDebug
+./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
 ```
 
-Toolchain: AGP 8.7.3, Kotlin 2.0.21, Compose BOM 2024.12.01, ARCore 1.57.0, compile/target SDK 35,
+The committed wrapper selects Gradle 8.14.6 and checks its distribution SHA-256.
+The wrapper JAR was checked against Gradle's published checksum, and CI validates
+wrapper JARs before running Gradle. Updating it requires checking the new version
+and checksums against [Gradle's releases](https://gradle.org/releases/) first.
+The project does not yet provide a fully reviewed transitive dependency lock or
+Gradle dependency-verification metadata; the wrapper checksum covers Gradle itself.
+
+Toolchain: Gradle 8.14.6, AGP 8.7.3, Kotlin 2.0.21, Compose BOM 2024.12.01, ARCore 1.57.0, compile/target SDK 35,
 min SDK 29. JVM unit tests (`app/src/test`) cover the bundle JSON, matrices, depth encoding, the
 fallback layout, depth/pose pairing, the scan hints and the room verdict.
 

@@ -5,26 +5,16 @@ import android.content.Intent
 import android.net.Uri
 import androidx.core.content.FileProvider
 import java.io.File
-import java.util.UUID
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
-/** Zips a session folder into cacheDir/share/ (manifest.json at the zip root) for the share sheet. */
+/** Zips a session into an export directory allocated by [SessionFiles], with manifest.json at the root. */
 object ZipShare {
-    private const val DAY_MS = 86_400_000L
     /** already-compressed files are stored, everything else deflated */
     private val STORED = setOf("jpg", "f16z")
 
-    fun zip(context: Context, folder: File, name: String): File {
-        val root = File(context.cacheDir, "share")
-        root.mkdirs()
-        // Unique directories keep two exports from deleting each other's files;
-        // anything older than a day is an abandoned share.
-        val cutoff = System.currentTimeMillis() - DAY_MS
-        root.listFiles().orEmpty().filter { it.lastModified() < cutoff }.forEach { it.deleteRecursively() }
-        val dir = File(root, UUID.randomUUID().toString())
-        dir.mkdirs()
+    fun zip(folder: File, dir: File, name: String): File {
         val safe = name.replace('/', '-').replace(':', '-').ifBlank { "Room" }
         val dest = File(dir, "$safe.zip")
         try {
@@ -43,7 +33,11 @@ object ZipShare {
                 }
             }
         } catch (e: Exception) {
-            dir.deleteRecursively()
+            try {
+                deleteTreeChecked(dir)
+            } catch (cleanup: Exception) {
+                e.addSuppressed(cleanup)
+            }
             throw e
         }
         return dest

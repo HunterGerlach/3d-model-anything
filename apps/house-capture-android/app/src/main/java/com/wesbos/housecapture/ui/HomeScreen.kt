@@ -63,12 +63,17 @@ import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
 import kotlin.math.roundToInt
 
+private enum class LibraryError { LOAD, DELETE }
+
 /** Room library on disk plus "Scan a room". Loads off the main thread; reloads after a delete. */
 @Composable
 fun HomeScreen(library: RoomLibrary, onScan: (String) -> Unit, onOpen: (String) -> Unit) {
     var generation by remember { mutableIntStateOf(0) }
+    var error by remember { mutableStateOf<LibraryError?>(null) }
     val rooms by produceState<List<RoomSummary>?>(null, library, generation) {
-        value = withContext(Dispatchers.IO) { runCatching { library.list() }.getOrDefault(emptyList()) }
+        withContext(Dispatchers.IO) { runCatching { library.list() } }
+            .onSuccess { value = it }
+            .onFailure { if (error != LibraryError.DELETE) error = LibraryError.LOAD }
     }
     val scope = rememberCoroutineScope()
     HomeContent(
@@ -78,10 +83,28 @@ fun HomeScreen(library: RoomLibrary, onScan: (String) -> Unit, onOpen: (String) 
         onDelete = { sessionId ->
             scope.launch {
                 withContext(Dispatchers.IO) { runCatching { library.delete(sessionId) } }
+                    .onFailure { error = LibraryError.DELETE }
                 generation++
             }
         },
     )
+
+    error?.let { failure ->
+        AlertDialog(
+            onDismissRequest = { error = null },
+            title = { Text(stringResource(if (failure == LibraryError.DELETE) R.string.delete_failed_title else R.string.library_failed_title)) },
+            text = { Text(stringResource(if (failure == LibraryError.DELETE) R.string.delete_failed_body else R.string.library_failed_body)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    error = null
+                    if (failure == LibraryError.LOAD) generation++
+                }) {
+                    Text(stringResource(if (failure == LibraryError.LOAD) R.string.retry else R.string.ok), color = Fieldwork.orange)
+                }
+            },
+            containerColor = Fieldwork.paper,
+        )
+    }
 }
 
 @Composable

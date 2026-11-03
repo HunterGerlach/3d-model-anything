@@ -27,19 +27,22 @@ manifest's room when it lists exactly one (Android exports are one room per sess
 Needs: pip install numpy pillow
 """
 import argparse
+import io
 import json
 import math
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 import uuid
-import zlib
 
 import numpy as np
 
 from reconstruct_bundle import ARKIT_TO_CV, despeckle
+from bundle_io import (MAX_JSON_BYTES, MAX_PLY_BYTES, MAX_PLY_FACES, MAX_PLY_VERTICES,
+                       atomic_output, bundle_path, check_points, checked_shape,
+                       depth_budget, load_depth_frame, output_path, pose_matrix, read_bytes,
+                       read_json, records, room_index, write_json)
 
 UP = np.array([0.0, 1.0, 0.0])
 PLY_TYPES = {'char': 'i1', 'int8': 'i1', 'uchar': 'u1', 'uint8': 'u1', 'short': '<i2', 'int16': '<i2',
@@ -49,41 +52,22 @@ CLASS_COLORS = np.array([(150, 150, 150), (225, 225, 225), (190, 150, 110), (245
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 
 
-def read_json(path, default=None):
-    if not os.path.exists(path):
-        return default
-    with open(path) as fh:
-        return json.load(fh)
-
-
 def m4(t):
-    return np.array(t, dtype=np.float64).reshape(4, 4).T  # column-major → row-major
+    return pose_matrix(t)  # column-major → row-major, with finite rigid-pose validation
 
 
 # --- points ----------------------------------------------------------------------------
 
 def room_frames(bundle, room):
-    frames = read_json(os.path.join(bundle, 'depth/frames.json'), [])
+    frames = records(read_json(bundle_path(bundle, 'depth/frames.json'), []), 'depth frames')
     return [f for f in frames if f.get('room', room) == room]
 
 
 def load_frame(bundle, f, min_conf=1):
     """Depth (m, 0 = invalid) with low-confidence pixels removed, intrinsics K, OpenCV camera-to-world,
     and the high-confidence (2) pixel mask (all True when the bundle has no confidence file)."""
-    w, h = f['width'], f['height']
-    with open(os.path.join(bundle, f['file']), 'rb') as fh:
-        raw = fh.read()
-    if f['file'].endswith('.f16z'):
-        raw = zlib.decompress(raw, -15)
-    depth = np.frombuffer(raw, dtype='<f2').astype(np.float32).reshape(h, w).copy()
-    depth[~np.isfinite(depth)] = 0
-    sure = np.ones((h, w), bool)
-    if f.get('confidence') and os.path.exists(os.path.join(bundle, f['confidence'])):
-        conf = np.fromfile(os.path.join(bundle, f['confidence']), dtype=np.uint8).reshape(h, w)
-        depth[conf < min_conf] = 0
-        sure = conf >= 2
-    k = np.array(f['intrinsics'], dtype=np.float64).reshape(3, 3).T
-    return despeckle(depth), k, m4(f['transform']) @ ARKIT_TO_CV, sure
+    depth, k, pose, sure = load_depth_frame(bundle, f, min_conf)
+    return despeckle(depth), k, pose @ ARKIT_TO_CV, sure
 
 
 def frame_points(depth, k, cam_to_world, near=0.3, far=4.0):
@@ -111,6 +95,7 @@ def frame_points(depth, k, cam_to_world, near=0.3, far=4.0):
 
 def voxel_down(p, n, cell):
     """One point per occupied voxel: mean position, mean (renormalized) normal."""
+    check_points(p)
     key = np.floor(p / cell).astype(np.int64) + (1 << 20)
     key = (key[:, 0] << 42) | (key[:, 1] << 21) | key[:, 2]
     _, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
@@ -130,12 +115,21 @@ def pixel_rays(depth, k, cam_to_world, stride=1, near=0.3):
 
 def depth_points(loaded, cell):
     pts, nrm = [], []
+    buffered = 0
     for depth, k, c2w, _ in loaded:
         p, n = frame_points(depth, k, c2w)
         if len(p):
             p, n = voxel_down(p, n, cell)
             pts.append(p)
             nrm.append(n)
+            buffered += len(p)
+            # Consolidate incrementally instead of retaining every frame's
+            # points until one potentially huge concatenation at the end.
+            if buffered >= MAX_PLY_VERTICES:
+                p, n = voxel_down(np.concatenate(pts), np.concatenate(nrm), cell)
+                if len(p) > MAX_PLY_VERTICES:
+                    raise ValueError('point cloud exceeds the room-scan limit; use a coarser cell size')
+                pts, nrm, buffered = [p], [n], len(p)
     if not pts:
         raise ValueError('no valid depth pixels in the depth frames')
     return voxel_down(np.concatenate(pts), np.concatenate(nrm), cell)
@@ -145,7 +139,7 @@ def free_space(loaded, Rm, origin, shape, cell, stride=4, far=5.0):
     """Heading-frame cells that depth rays crossed on their way to a surface: the room's open floor area,
     even where the floor itself was hidden or never looked at. Only confident rays up to `far` meters
     carve, so long or noisy readings through windows and doorways don't open up the outside."""
-    free = np.zeros(shape, bool)
+    free = np.zeros(checked_shape(shape), bool)
     for depth, k, c2w, sure in loaded:
         dirs, z = pixel_rays(np.where(sure & (depth < far), depth, 0), k, c2w, stride)
         if not len(z):
@@ -154,6 +148,8 @@ def free_space(loaded, Rm, origin, shape, cell, stride=4, far=5.0):
         start = cam[[0, 2]] @ Rm.T
         end = (cam + dirs * (z[:, None] * 0.97 - 0.03))[:, [0, 2]] @ Rm.T  # stop short of the surface
         steps = int(np.ceil(np.linalg.norm(end - start, axis=1).max() / (cell / 2))) + 1
+        if steps > 10000:
+            raise ValueError('depth-ray traversal exceeds the room-scan limit; check camera intrinsics')
         for s in np.linspace(0, 1, steps):
             ix = ((start + (end - start) * s - origin) / cell).astype(int)
             ok = (ix >= 0).all(1) & (ix < np.array(shape)).all(1)
@@ -162,46 +158,63 @@ def free_space(loaded, Rm, origin, shape, cell, stride=4, far=5.0):
 
 
 def read_ply(path):
-    """Minimal PLY reader (ascii / binary little-endian) → vertices, vertex normals or None, triangles or None."""
-    with open(path, 'rb') as fh:
+    """Bounded PLY reader for vertices and triangle faces (ASCII / little-endian)."""
+    def integer(token, kind):
+        value = int(token)
+        bounds = np.iinfo(PLY_TYPES[kind])
+        if not bounds.min <= value <= bounds.max:
+            raise ValueError(f'{path}: integer is outside its declared PLY type')
+        return value
+
+    with io.BytesIO(read_bytes(path, MAX_PLY_BYTES)) as fh:
         if fh.readline().strip() != b'ply':
             raise ValueError(f'{path}: not a PLY file')
         fmt, elements = None, []
         while True:
-            line = fh.readline()
-            if not line:
-                raise ValueError(f'{path}: truncated header')
-            parts = line.decode('ascii', 'replace').split()
+            line = fh.readline(4097)
+            if not line or len(line) > 4096 or fh.tell() > 65536:
+                raise ValueError(f'{path}: missing or oversized PLY header')
+            parts = line.decode('ascii').split()
             if not parts or parts[0] in ('comment', 'obj_info'):
                 continue
             if parts[0] == 'format':
+                if len(parts) != 3 or parts[2] != '1.0' or fmt is not None:
+                    raise ValueError(f'{path}: invalid PLY format')
                 fmt = parts[1]
             elif parts[0] == 'element':
-                elements.append((parts[1], int(parts[2]), []))
+                if len(parts) != 3 or parts[1] not in ('vertex', 'face') or any(e[0] == parts[1] for e in elements):
+                    raise ValueError(f'{path}: unsupported or duplicate PLY element')
+                count = int(parts[2])
+                maximum = MAX_PLY_VERTICES if parts[1] == 'vertex' else MAX_PLY_FACES
+                if not 0 <= count <= maximum:
+                    raise ValueError(f'{path}: PLY element count exceeds {maximum:,}')
+                elements.append((parts[1], count, []))
             elif parts[0] == 'property':
+                if not elements or len(elements[-1][2]) >= 32:
+                    raise ValueError(f'{path}: invalid PLY property count')
+                if parts[1:2] == ['list']:
+                    if (len(parts) != 5 or elements[-1][0] != 'face'
+                            or parts[2] not in ('uchar', 'uint8')
+                            or parts[3] not in ('int', 'int32', 'uint', 'uint32')
+                            or parts[4] not in ('vertex_indices', 'vertex_index')):
+                        raise ValueError(f'{path}: only triangle vertex-index lists are supported')
+                elif len(parts) != 3 or parts[1] not in PLY_TYPES:
+                    raise ValueError(f'{path}: unsupported PLY property')
+                if any(p[-1] == parts[-1] for p in elements[-1][2]):
+                    raise ValueError(f'{path}: duplicate PLY property')
                 elements[-1][2].append(parts[1:])
             elif parts[0] == 'end_header':
                 break
+            else:
+                raise ValueError(f'{path}: unsupported PLY header field')
         body = fh.read()
     if fmt not in ('ascii', 'binary_little_endian'):
         raise ValueError(f'{path}: unsupported PLY format {fmt}')
-    data, offset, tokens, pos = {}, 0, (body.split() if fmt == 'ascii' else None), 0
+    data, offset = {}, 0
+    ascii_body = io.BytesIO(body) if fmt == 'ascii' else None
     for name, count, props in elements:
-        if fmt == 'ascii':
-            rows = []
-            for _ in range(count):
-                row = {}
-                for prop in props:
-                    if prop[0] == 'list':
-                        k = int(tokens[pos])
-                        row[prop[3]] = [float(t) for t in tokens[pos + 1:pos + 1 + k]]
-                        pos += 1 + k
-                    else:
-                        row[prop[1]] = float(tokens[pos])
-                        pos += 1
-                rows.append(row)
-            data[name] = {key: np.array([r[key] for r in rows]) for key in (rows[0] if rows else {})}
-            continue
+        if not props:
+            raise ValueError(f'{path}: PLY element has no properties')
         fields = []
         for prop in props:
             if prop[0] == 'list':
@@ -209,19 +222,54 @@ def read_ply(path):
             else:
                 fields.append((prop[1], PLY_TYPES[prop[0]]))
         dt = np.dtype(fields)
-        arr = np.frombuffer(body, dt, count, offset)
-        offset += dt.itemsize * count
+        if dt.itemsize * count > MAX_PLY_BYTES:
+            raise ValueError(f'{path}: decoded PLY element exceeds the working-set limit')
+        if fmt == 'ascii':
+            if count > len(body):
+                raise ValueError(f'{path}: truncated PLY body')
+            arr = np.zeros(count, dt)
+            for row in range(count):
+                line = ascii_body.readline(8193)
+                if not line or len(line) > 8192:
+                    raise ValueError(f'{path}: missing or oversized PLY row')
+                tokens, pos = line.split(), 0
+                needed = sum(4 if p[0] == 'list' else 1 for p in props)
+                if len(tokens) != needed:
+                    raise ValueError(f'{path}: invalid PLY row length')
+                for prop in props:
+                    if prop[0] == 'list':
+                        if int(tokens[pos]) != 3:
+                            raise ValueError(f'{path}: only triangle faces are supported')
+                        arr['count_' + prop[3]][row] = 3
+                        arr[prop[3]][row] = [integer(t, prop[2]) for t in tokens[pos + 1:pos + 4]]
+                        pos += 4
+                    else:
+                        arr[prop[1]][row] = (integer(tokens[pos], prop[0])
+                                            if np.dtype(PLY_TYPES[prop[0]]).kind in 'iu' else float(tokens[pos]))
+                        pos += 1
+        else:
+            if offset + dt.itemsize * count > len(body):
+                raise ValueError(f'{path}: truncated PLY body')
+            arr = np.frombuffer(body, dt, count, offset)
+            offset += dt.itemsize * count
         for prop in props:
             if prop[0] == 'list' and count and (arr['count_' + prop[3]] != 3).any():
                 raise ValueError(f'{path}: only triangle faces are supported')
         data[name] = {key: arr[key] for key in dt.names}
     v = data.get('vertex')
-    if not v or 'x' not in v:
+    if not v or not {'x', 'y', 'z'} <= v.keys():
         raise ValueError(f'{path}: no vertex positions')
     V = np.c_[v['x'], v['y'], v['z']].astype(np.float64)
+    check_points(V, 'PLY')
+    if any(k in v for k in ('nx', 'ny', 'nz')) and not {'nx', 'ny', 'nz'} <= v.keys():
+        raise ValueError(f'{path}: incomplete vertex normals')
     N = np.c_[v['nx'], v['ny'], v['nz']].astype(np.float64) if 'nx' in v else None
+    if N is not None and (not np.isfinite(N).all() or (np.abs(N) > 1e6).any()):
+        raise ValueError(f'{path}: invalid vertex normals')
     face = data.get('face', {})
     F = next((np.asarray(face[k]).astype(np.int64).reshape(-1, 3) for k in ('vertex_indices', 'vertex_index') if k in face), None)
+    if F is not None and len(F) and (F.min() < 0 or F.max() >= len(V)):
+        raise ValueError(f'{path}: triangle index is outside the vertex array')
     return V, N, (F if F is not None and len(F) else None)
 
 
@@ -398,6 +446,7 @@ def peaks(values, lo, hi, step=0.02, min_frac=0.02):
     """Bin centers of local maxima (3-bin smoothed) that hold at least min_frac of the values."""
     if len(values) == 0 or hi <= lo:
         return []
+    checked_shape((math.ceil((hi - lo) / step) + 2,), 'height histogram')
     edges = np.arange(lo, hi + step, step)
     h, _ = np.histogram(values, edges)
     s = np.convolve(h, np.ones(3), 'same')
@@ -436,7 +485,7 @@ def wall_raster(pr, y, ny, floor, ceiling, seen_ceiling, origin, shape, cell, fr
     sel = (np.abs(ny) < 0.5) & (y > floor + 0.2) & (y < ceiling - 0.2)
     b = np.minimum(((y[sel] - floor - 0.2) / 0.1).astype(np.int64), nb - 1)
     ix = ((pr[sel] - origin) / cell).astype(np.int64)
-    bits = np.zeros(shape, np.int64)
+    bits = np.zeros(checked_shape(shape), np.int64)
     np.bitwise_or.at(bits, (ix[:, 0], ix[:, 1]), np.left_shift(np.int64(1), b))
     bits = dilate(bits, 1)  # voxels and raster cells don't line up; let neighbors share bins
     count = sum((bits >> k) & 1 for k in range(nb))
@@ -635,7 +684,10 @@ def wall_frames(poly, floor, height):
 def find_openings(loaded, walls, floor, cell=0.03):
     """Per wall, a (u, v) vote grid: depth rays crossing the wall rectangle that measure well beyond it
     (or floor continuing behind it) vote 'through', rays that end on it vote 'solid'."""
-    through = [np.zeros((max(1, math.ceil(w['length'] / cell)), max(1, math.ceil(w['height'] / cell)))) for w in walls]
+    shapes = [checked_shape((max(1, math.ceil(w['length'] / cell)), max(1, math.ceil(w['height'] / cell))),
+                            'wall openings') for w in walls]
+    checked_shape((max(1, sum(math.prod(shape) for shape in shapes)),), 'combined wall openings')
+    through = [np.zeros(shape) for shape in shapes]
     solid = [np.zeros_like(t) for t in through]
     for depth, k, c2w, _ in loaded:
         dirs, z = pixel_rays(depth, k, c2w)
@@ -703,7 +755,7 @@ def find_objects(points, floor, ceiling, poly, Rm, cell=0.05):
         return []
     origin = p.min(0) - cell
     ix = ((p - origin) / cell).astype(int)
-    occ = np.zeros(tuple(ix.max(0) + 2), bool)
+    occ = np.zeros(checked_shape(ix.max(0) + 2, 'object raster'), bool)
     occ[ix[:, 0], ix[:, 1]] = True
     labels, n = components(occ, diag=True)
     lab = labels[ix[:, 0], ix[:, 1]]
@@ -740,6 +792,8 @@ def point_classes(points, normals, floor, ceiling, poly):
 
 def surfels(points, normals, cell):
     """A cell-sized quad (two triangles, wound around the normal) per point, so the PLY has faces."""
+    if len(points) > MAX_PLY_VERTICES // 4:
+        raise ValueError('surfel mesh exceeds the vertex limit; use a coarser cell size')
     a = np.where(np.abs(normals[:, 1:2]) > 0.9, [[1.0, 0, 0]], [[0, 1.0, 0]])
     t1 = np.cross(normals, a)
     t1 /= np.linalg.norm(t1, axis=1, keepdims=True)
@@ -753,6 +807,8 @@ def surfels(points, normals, cell):
 
 def write_ply(path, V, N, colors, F, face_class):
     """Binary PLY with the iOS app's vertex/face schema (CoverageEngine.writePLY)."""
+    if len(V) > MAX_PLY_VERTICES or len(F) > MAX_PLY_FACES:
+        raise ValueError('mesh exceeds the room-scan vertex/face limits')
     vd = np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'), ('nx', '<f4'), ('ny', '<f4'), ('nz', '<f4'),
                    ('coverage', '<f4'), ('red', 'u1'), ('green', 'u1'), ('blue', 'u1'), ('inroom', 'u1')])
     fd = np.dtype([('count', 'u1'), ('vertex_indices', '<u4', (3,)), ('class', 'u1')])
@@ -771,44 +827,63 @@ def write_ply(path, V, N, colors, F, face_class):
               'property float nx\nproperty float ny\nproperty float nz\nproperty float coverage\n'
               'property uchar red\nproperty uchar green\nproperty uchar blue\nproperty uchar inroom\n'
               f'element face {len(F)}\nproperty list uchar uint vertex_indices\nproperty uchar class\nend_header\n')
-    with open(path + '.tmp', 'wb') as fh:
+    with atomic_output(path) as fh:
         fh.write(header.encode())
         fh.write(verts.tobytes())
         fh.write(faces.tobytes())
-    os.replace(path + '.tmp', path)
-
-
-def write_json(path, data):
-    with open(path + '.tmp', 'w') as fh:
-        json.dump(data, fh, indent=1, allow_nan=False)
-    os.replace(path + '.tmp', path)
 
 
 def synthesize(bundle, room, points=None, from_depth=False, cell=0.03, min_wall=0.4, free_walls=False,
                objects=True, write_bundle=False, out_dir=None, plan=None, force=False, max_frames=400):
     """Build RoomPlan-shaped JSON for one room; see the module docstring. Returns the room dict."""
+    room = room_index(room)
+    if not math.isfinite(cell) or not 0.005 <= cell <= 1:
+        raise ValueError('cell size must be between 0.005 and 1 meter')
+    if not math.isfinite(min_wall) or not 0.05 <= min_wall <= 200:
+        raise ValueError('minimum wall length must be between 0.05 and 200 meters')
+    if type(max_frames) is not int or not 1 <= max_frames <= 10000:
+        raise ValueError('max-frames must be an integer between 1 and 10000')
     if points and from_depth:
         raise ValueError('use either --points or --from-depth')
-    manifest_path = os.path.join(bundle, 'manifest.json')
+    manifest_path = bundle_path(bundle, 'manifest.json')
     manifest = read_json(manifest_path)
+    if manifest is not None and not isinstance(manifest, dict):
+        raise ValueError('manifest must be a JSON object')
     capture = (manifest or {}).get('capture') or {}
+    if not isinstance(capture, dict):
+        raise ValueError('manifest capture must be an object')
+    for rec in records((manifest or {}).get('rooms', []), 'manifest rooms'):
+        room_index(rec['index'])
+    synthesized_rooms = capture.get('synthesizedRooms', [])
+    if not isinstance(synthesized_rooms, list) or len(synthesized_rooms) > 10000:
+        raise ValueError('synthesizedRooms must be a list of room indices')
+    for i in synthesized_rooms:
+        room_index(i)
+    backup = None
     if write_bundle:
         if manifest is None:
             raise ValueError('--write-bundle needs the bundle manifest.json')
         if room in capture.get('synthesizedRooms', []) and not force:
             raise ValueError(f'rooms/room-{room}.json is already synthesized; pass --force to redo it '
                              f'(the app original stays in rooms/room-{room}.arcore.json)')
+        # Preflight every bundle output before doing expensive reconstruction.
+        room_path = output_path(bundle, f'rooms/room-{room}.json')
+        original = output_path(bundle, f'rooms/room-{room}.arcore.json')
+        mesh_path = output_path(bundle, f'mesh/room-{room}.ply')
+        if room_path.exists() and not original.exists():
+            backup = read_bytes(room_path, MAX_JSON_BYTES)
     out_file = None
     if out_dir or not write_bundle:
-        out_dir = out_dir or os.path.join(bundle, 'synth')
-        out_file = os.path.join(out_dir, f'room-{room}.json')
+        out_dir = out_dir or bundle_path(bundle, 'synth')
+        out_file = output_path(out_dir, f'room-{room}.json')
         if os.path.exists(out_file) and not force:
             raise ValueError(f'{out_file} exists; pass --force to overwrite')
 
     frames = room_frames(bundle, room)
     frames = frames[::max(1, math.ceil(len(frames) / max_frames))]
-    photos_path = os.path.join(bundle, 'photos/photos.json')
-    photos = [p for p in read_json(photos_path, []) if p.get('room', room) == room]
+    depth_budget(frames)
+    photos_path = bundle_path(bundle, 'photos/photos.json')
+    photos = [p for p in records(read_json(photos_path, []), 'photos') if p.get('room', room) == room]
     cams = np.array([m4(x['transform'])[:3, 3] for x in frames + photos]).reshape(-1, 3)
 
     # 1. points
@@ -830,6 +905,7 @@ def synthesize(bundle, room, points=None, from_depth=False, cell=0.03, min_wall=
         print(f'{len(frames)} depth frames → {len(pts):,} points at {cell * 100:.0f} cm')
 
     # 2-3. floor, ceiling, heading
+    check_points(np.r_[pts, cams], 'points and camera path')
     floor, ceiling, seen_ceiling, seen_floor = floor_ceiling(pts, nrm, cams)
     theta = heading(nrm)
     Rm = rot2(-theta)
@@ -840,7 +916,7 @@ def synthesize(bundle, room, points=None, from_depth=False, cell=0.03, min_wall=
     cam_r = cams[:, [0, 2]] @ Rm.T if len(cams) else np.zeros((0, 2))
     all_r = np.r_[pr, cam_r]
     origin = all_r.min(0) - 10 * cell
-    shape = tuple(np.ceil((all_r.max(0) - origin) / cell).astype(int) + 10)
+    shape = checked_shape(np.ceil((all_r.max(0) - origin) / cell).astype(int) + 10)
     walls_mask = wall_raster(pr, pts[:, 1], nrm[:, 1], floor, ceiling, seen_ceiling, origin, shape, cell)
     wall_cells = origin + (np.argwhere(walls_mask) + 0.5) * cell
     xlines, zlines, free_lines = [], [], None
@@ -919,18 +995,10 @@ def synthesize(bundle, room, points=None, from_depth=False, cell=0.03, min_wall=
     for i, w in enumerate(out['walls']):
         print(f"  wall {i}: {w['dimensions'][0]:.2f} × {w['dimensions'][1]:.2f} m  {next(iter(w['confidence']))}")
 
-    # 10. write
-    if out_file:
-        os.makedirs(out_dir, exist_ok=True)
-        write_json(out_file, out)
-        print(out_file)
+    # Prepare derived mesh and validate serialization before changing persistent
+    # files. Replacements below are atomic per file, not a multi-file transaction.
+    json.dumps(out, allow_nan=False)
     if write_bundle:
-        rooms_dir = os.path.join(bundle, 'rooms')
-        os.makedirs(rooms_dir, exist_ok=True)
-        room_path, original = os.path.join(rooms_dir, f'room-{room}.json'), os.path.join(rooms_dir, f'room-{room}.arcore.json')
-        if os.path.exists(room_path) and not os.path.exists(original):
-            shutil.copyfile(room_path, original)
-        write_json(room_path, out)
         if mesh is not None:
             V, N, F = mesh
             vcls = point_classes(V, N, floor, ceiling, poly)
@@ -941,9 +1009,7 @@ def synthesize(bundle, room, points=None, from_depth=False, cell=0.03, min_wall=
             vcls = point_classes(pts, nrm, floor, ceiling, poly)
             V, N, F = surfels(pts, nrm, cell)
             fcls, vcls = np.repeat(vcls, 2), np.repeat(vcls, 4)
-        os.makedirs(os.path.join(bundle, 'mesh'), exist_ok=True)
         mesh_file = f'mesh/room-{room}.ply'
-        write_ply(os.path.join(bundle, mesh_file), V, N, CLASS_COLORS[vcls], F, fcls)
         record = {'file': mesh_file, 'anchors': 1, 'vertices': int(len(V)), 'faces': int(len(F))}
         for rec in manifest.get('rooms', []):
             if rec.get('index') == room:
@@ -953,16 +1019,32 @@ def synthesize(bundle, room, points=None, from_depth=False, cell=0.03, min_wall=
         capture.update({'layoutSource': 'android_synthesize_room.py', 'synthesized': True,
                         'synthesizedRooms': sorted(set(capture.get('synthesizedRooms', [])) | {room})})
         manifest['capture'] = capture
+        json.dumps(manifest, allow_nan=False)
+
+    # 10. write
+    if out_file:
+        os.makedirs(out_dir, exist_ok=True)
+        write_json(out_file, out)
+        print(out_file)
+    if write_bundle:
+        os.makedirs(bundle_path(bundle, 'rooms'), exist_ok=True)
+        if backup is not None:
+            with atomic_output(original) as fh:
+                fh.write(backup)
+        write_json(room_path, out)
+        os.makedirs(bundle_path(bundle, 'mesh'), exist_ok=True)
+        write_ply(mesh_path, V, N, CLASS_COLORS[vcls], F, fcls)
         write_json(manifest_path, manifest)
         print(f'wrote rooms/room-{room}.json, {mesh_file} ({len(V):,} vertices, {len(F):,} faces), manifest.json')
 
     if plan:
         with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)  # canonicalize the caller-created root (e.g. macOS /var)
             os.makedirs(os.path.join(tmp, 'rooms'))
             write_json(os.path.join(tmp, f'rooms/room-{room}.json'), out)
             if os.path.exists(photos_path):
                 os.makedirs(os.path.join(tmp, 'photos'))
-                shutil.copyfile(photos_path, os.path.join(tmp, 'photos/photos.json'))
+                write_json(os.path.join(tmp, 'photos/photos.json'), photos)
             subprocess.run([sys.executable, os.path.join(SCRIPTS, 'bundle_to_room.py'), tmp, '--room', str(room),
                             '-o', os.path.join(tmp, 'room.json'), '--plan', plan], check=True)
     return out
@@ -985,16 +1067,20 @@ def main():
     ap.add_argument('-o', default=None, help='output directory for room-N.json (default <bundle>/synth unless --write-bundle)')
     ap.add_argument('--plan', default=None, help='draw the result (bundle_to_room.py plan)')
     a = ap.parse_args()
-    if a.room is None:
-        rooms = (read_json(os.path.join(a.bundle, 'manifest.json')) or {}).get('rooms') or []
-        if len(rooms) != 1:
-            ap.error(f'pass --room: the manifest lists {len(rooms)} rooms')
-        a.room = rooms[0]['index']
     try:
+        if a.room is None:
+            manifest = read_json(bundle_path(a.bundle, 'manifest.json'))
+            if manifest is not None and not isinstance(manifest, dict):
+                raise ValueError('manifest must be a JSON object')
+            rooms = (manifest or {}).get('rooms') or []
+            rooms = records(rooms, 'manifest rooms')
+            if len(rooms) != 1:
+                ap.error(f'pass --room: the manifest lists {len(rooms)} rooms')
+            a.room = room_index(rooms[0]['index'])
         synthesize(a.bundle, a.room, points=a.points, from_depth=a.from_depth, cell=a.cell, min_wall=a.min_wall,
                    free_walls=a.free_walls, objects=not a.no_objects, write_bundle=a.write_bundle, out_dir=a.o,
                    plan=a.plan, force=a.force, max_frames=a.max_frames)
-    except (ValueError, OSError, KeyError) as error:
+    except (ValueError, OSError, KeyError, TypeError, OverflowError) as error:
         ap.error(str(error))
 
 
