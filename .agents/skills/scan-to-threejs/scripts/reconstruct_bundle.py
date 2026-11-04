@@ -7,27 +7,62 @@ frames + posed photos (works even when the bundle's own mesh is missing).
   3. color each vertex from the best photo that actually sees it: visibility by
      ray casting against the mesh itself, preference for close, head-on, sharp views
 
-usage: reconstruct_bundle.py <bundle> [--room room.json] [--voxel 0.015] [--faces 400000] [-o outdir]
+usage: reconstruct_bundle.py <bundle> [--room room.json] [--voxel 0.015] [--faces 400000] [--despeckle] [-o outdir]
 
+Android (ARCore) bundles: raw depth is noisier and sparser than LiDAR; use
+--voxel 0.03 --trunc 5 --despeckle.
 Writes <outdir>/scan_world.ply (ARKit world coords) and, with --room (from
 bundle_to_room.py), scan_room.ply + scan_room.glb in room coordinates for the viewer.
 Needs: pip install open3d pillow numpy
 """
 import argparse
-import json
+import io
+import math
 import os
 import time
-import zlib
 
 import numpy as np
-import open3d as o3d
 from PIL import Image
+from bundle_io import (MAX_PHOTO_PIXELS, atomic_output, atomic_path, bundle_path,
+                       check_points, checked_shape, depth_budget, dimensions,
+                       intrinsics_matrix, load_depth_frame, pose_matrix, read_bytes,
+                       read_json, records, write_json)
 
 ARKIT_TO_CV = np.diag([1.0, -1.0, -1.0, 1.0])  # camera: +y up/-z forward → +y down/+z forward
 
 
 def mat(cm):
-    return np.array(cm, dtype=np.float64).reshape(4, 4).T  # column-major → row-major
+    return pose_matrix(cm)  # column-major → row-major, with finite rigid-pose validation
+
+
+def bundle_image(bundle, relative):
+    """Decode only a contained, bounded image; Pillow checks the encoded format."""
+    raw = read_bytes(bundle_path(bundle, relative), 64 * 1024 * 1024)
+    with Image.open(io.BytesIO(raw)) as source:
+        dimensions({'width': source.width, 'height': source.height}, MAX_PHOTO_PIXELS)
+        return source.convert('RGB')
+
+
+LIDAR_MIN_SIDE = 192  # iPhone LiDAR depth is 256×192; ARCore raw depth is smaller (e.g. 160×120)
+
+
+def sample_step(h, w):
+    """Pixel stride for the bounds sample: every 16th pixel for LiDAR-sized depth (unchanged), ~40 samples
+    across the short side for smaller (ARCore) depth images."""
+    return 16 if min(h, w) >= LIDAR_MIN_SIDE else max(1, min(h, w) // 40)
+
+
+def despeckle(depth, jump=0.1):
+    """3×3 median of the valid neighbors; drops pixels next to a >10 % depth jump (flying pixels). 0 = invalid."""
+    h, w = depth.shape
+    p = np.pad(depth, 1, mode='edge')
+    stack = np.stack([p[y:y + h, x:x + w] for y in range(3) for x in range(3)])
+    jumpy = ((np.abs(stack - depth) > jump * depth) & (stack > 0)).any(0)
+    stack = np.where(stack > 0, stack, np.nan)
+    stack[4] = depth  # the center is never NaN, so the median below always has a value
+    out = np.nanmedian(stack, axis=0).astype(depth.dtype)
+    out[(depth <= 0) | jumpy] = 0
+    return out
 
 
 def main():
@@ -40,17 +75,28 @@ def main():
     ap.add_argument('--faces', type=int, default=0, help='Open3D quadric simplification target (0 = off: it tears holes in fused meshes; simplify the GLB with gltf-transform instead)')
     ap.add_argument('--max-depth', type=float, default=3.5)
     ap.add_argument('--min-confidence', type=int, default=1)
+    ap.add_argument('--despeckle', action='store_true', help='median-filter depth and drop flying pixels (ARCore raw depth)')
     ap.add_argument('-o', default=None)
     a = ap.parse_args()
-    out = a.o or os.path.join(a.bundle, 'recon')
+    if not math.isfinite(a.voxel) or not 0.01 <= a.voxel <= 0.5:
+        ap.error('--voxel must be between 0.01 and 0.5 meter')
+    if not math.isfinite(a.max_depth) or not 0.1 <= a.max_depth <= 20:
+        ap.error('--max-depth must be between 0.1 and 20 meters')
+    if not math.isfinite(a.trunc) or not 1 <= a.trunc <= 20:
+        ap.error('--trunc must be between 1 and 20 voxels')
+    if a.min_confidence not in (0, 1, 2) or a.faces < 0:
+        ap.error('invalid confidence or face count')
+    import open3d as o3d  # imported here so the helpers above work without it (test_android_bundle.py)
+
+    out = a.o or bundle_path(a.bundle, 'recon')
     os.makedirs(out, exist_ok=True)
     t0 = time.time()
 
     # --- 1. TSDF fusion -------------------------------------------------------------
     # (ScalableTSDFVolume returns nothing in the Open3D 0.20 macOS wheels, so fuse into
     # a grid of overlapping UniformTSDFVolume cubes covering the scanned area)
-    frames_path = os.path.join(a.bundle, 'depth/frames.json')
-    frames = json.load(open(frames_path)) if os.path.exists(frames_path) else []
+    frames_path = bundle_path(a.bundle, 'depth/frames.json')
+    frames = records(read_json(frames_path, []), 'depth frames')
     if not a.mesh and not frames:
         ap.error('depth frames missing; provide --mesh for a saved LiDAR mesh')
     if a.mesh:
@@ -59,23 +105,21 @@ def main():
             ap.error('--mesh must contain triangles')
         print(f'loaded existing mesh: {len(mesh.triangles):,} triangles')
     else:
+        depth_budget(frames)
         loaded = []
+        low_res = False
         lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
         for f in frames:
-            w, h = f['width'], f['height']
-            raw = open(os.path.join(a.bundle, f['file']), 'rb').read()
-            if f['file'].endswith('.f16z'):
-                raw = zlib.decompress(raw, -15)  # v4 bundles: raw DEFLATE
-            depth = np.frombuffer(raw, dtype='<f2').astype(np.float32).reshape(h, w).copy()
-            conf_path = os.path.join(a.bundle, f['confidence'])
-            if os.path.exists(conf_path):
-                conf = np.fromfile(conf_path, dtype=np.uint8).reshape(h, w)
-                depth[conf < a.min_confidence] = 0
-            depth[(depth > a.max_depth) | ~np.isfinite(depth)] = 0
-            k = np.array(f['intrinsics']).reshape(3, 3).T
-            cam_to_world = mat(f['transform']) @ ARKIT_TO_CV
+            depth, k, pose, _ = load_depth_frame(a.bundle, f, a.min_confidence)
+            h, w = depth.shape
+            depth[depth > a.max_depth] = 0
+            if a.despeckle:
+                depth = despeckle(depth)
+            cam_to_world = pose @ ARKIT_TO_CV
             # bounds from a sparse sample of back-projected points
-            ys, xs = np.mgrid[0:h:16, 0:w:16]
+            low_res |= min(h, w) < LIDAR_MIN_SIDE
+            step = sample_step(h, w)
+            ys, xs = np.mgrid[0:h:step, 0:w:step]
             z = depth[ys, xs].ravel()
             ok = z > 0
             pts = np.c_[(xs.ravel()[ok] - k[0, 2]) * z[ok] / k[0, 0], (ys.ravel()[ok] - k[1, 2]) * z[ok] / k[1, 1], z[ok], np.ones(ok.sum())]
@@ -83,11 +127,15 @@ def main():
                 wp = (cam_to_world @ pts.T).T[:, :3]
                 lo, hi = np.minimum(lo, wp.min(0)), np.maximum(hi, wp.max(0))
             loaded.append((depth, k, np.linalg.inv(cam_to_world)))
+        if low_res or a.despeckle:  # sparse ARCore samples can miss the outermost surfaces; LiDAR runs are unchanged
+            lo, hi = lo - 0.5, hi + 0.5
+        check_points(np.array([lo, hi]), 'fusion bounds')
         tile = 3.5
         res = int(round(tile / a.voxel))
         pad = a.voxel * 3
         nx, nz = int(np.ceil((hi[0] - lo[0]) / (tile - pad))), int(np.ceil((hi[2] - lo[2]) / (tile - pad)))
         ny = int(np.ceil((hi[1] - lo[1]) / (tile - pad)))
+        checked_shape((max(1, nx), max(1, ny), max(1, nz)), 'fusion tiles', limit=128)
         print(f'scan bounds {np.round(lo, 2)} … {np.round(hi, 2)} → {nx}×{ny}×{nz} tiles of {tile} m at {a.voxel * 100:.1f} cm')
         mesh = o3d.geometry.TriangleMesh()
         for ix in range(nx):
@@ -125,12 +173,12 @@ def main():
     print(f'cleaned → {len(mesh.triangles):,} triangles, {len(V):,} vertices ({time.time() - t0:.0f}s)')
 
     # --- 3. color from photos -----------------------------------------------------------
-    photos = json.load(open(os.path.join(a.bundle, 'photos/photos.json')))
+    photos = records(read_json(bundle_path(a.bundle, 'photos/photos.json'), []), 'photos')
     # v4 bundles also carry a 640×480 color image with every depth frame: use them as extra,
     # lower-weight views so surfaces no photo covered still get color
     for f in frames:
         if f.get('rgb'):
-            with Image.open(os.path.join(a.bundle, f['rgb'])) as rgb:
+            with bundle_image(a.bundle, f['rgb']) as rgb:
                 rgb_width, rgb_height = rgb.size
             photos.append({'file': f['rgb'], 'transform': f['transform'], 'intrinsics': f['rgbIntrinsics'],
                            'width': rgb_width, 'height': rgb_height, 'blurPixels': 3.0, 'lowres': True})
@@ -142,8 +190,8 @@ def main():
     for pi, ph in enumerate(photos):
         T = mat(ph['transform'])
         cam = T[:3, 3]
-        k = np.array(ph['intrinsics']).reshape(3, 3).T
-        W, H = ph['width'], ph['height']
+        W, H = dimensions(ph, MAX_PHOTO_PIXELS)
+        k = intrinsics_matrix(ph['intrinsics'], W, H)
         c = (np.linalg.inv(T) @ np.c_[V, np.ones(len(V))].T).T
         d = -c[:, 2]
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -170,7 +218,10 @@ def main():
         idx = idx[vis]
         if len(idx) == 0:
             continue
-        img = np.asarray(Image.open(os.path.join(a.bundle, ph['file'])).convert('RGB'), dtype=np.float32) / 255
+        with bundle_image(a.bundle, ph['file']) as photo:
+            if photo.size != (W, H):
+                raise ValueError('photo dimensions do not match metadata')
+            img = np.asarray(photo, dtype=np.float32) / 255
         # bilinear sample
         x, y = u[idx], v[idx]
         x0, y0 = np.floor(x).astype(int), np.floor(y).astype(int)
@@ -183,28 +234,38 @@ def main():
     covered = (source >= 0).mean()
     mesh.vertex_colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
     print(f'colored from {len(photos)} photos: {covered:.0%} of vertices seen ({time.time() - t0:.0f}s)')
-    o3d.io.write_triangle_mesh(os.path.join(out, 'scan_world.ply'), mesh)
-    np.save(os.path.join(out, 'vertex_photo.npy'), source)
-    with open(os.path.join(out, 'reconstruction.json'), 'w') as report:
-        json.dump({'sourceMesh': a.mesh, 'depthFrames': len(frames), 'photoSources': len(photos),
-                   'vertices': len(V), 'triangles': len(mesh.triangles),
-                   'coloredVertexFraction': float(covered)}, report, indent=2)
+    with atomic_path(bundle_path(out, 'scan_world.ply')) as path:
+        if not o3d.io.write_triangle_mesh(path, mesh):
+            raise OSError('could not write scan_world.ply')
+    with atomic_output(bundle_path(out, 'vertex_photo.npy')) as fh:
+        np.save(fh, source)
+    write_json(bundle_path(out, 'reconstruction.json'),
+               {'sourceMesh': a.mesh, 'depthFrames': len(frames), 'photoSources': len(photos),
+                'vertices': len(V), 'triangles': len(mesh.triangles),
+                'coloredVertexFraction': float(covered)})
 
     # --- 4. room coordinates -------------------------------------------------------------
     if a.room:
-        r = json.load(open(a.room))
+        r = read_json(a.room)
         W2R = mat(r['transform']['worldToRoom'])
         m2 = o3d.geometry.TriangleMesh(mesh)
         m2.transform(W2R)
         m2.compute_vertex_normals()
-        o3d.io.write_triangle_mesh(os.path.join(out, 'scan_room.ply'), m2)
+        with atomic_path(bundle_path(out, 'scan_room.ply')) as path:
+            if not o3d.io.write_triangle_mesh(path, m2):
+                raise OSError('could not write scan_room.ply')
         # glTF vertex colors are linear; the photos are sRGB
         c = np.asarray(m2.vertex_colors)
         m2.vertex_colors = o3d.utility.Vector3dVector(np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4))
-        o3d.io.write_triangle_mesh(os.path.join(out, 'scan_room.glb'), m2)
+        with atomic_path(bundle_path(out, 'scan_room.glb')) as path:
+            if not o3d.io.write_triangle_mesh(path, m2):
+                raise OSError('could not write scan_room.glb')
         print('wrote scan_room.ply / scan_room.glb (room coordinates)')
     print(f'done in {time.time() - t0:.0f}s → {out}')
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except (ValueError, OSError, KeyError, TypeError, OverflowError) as error:
+        raise SystemExit(f'invalid scan input: {error}') from error

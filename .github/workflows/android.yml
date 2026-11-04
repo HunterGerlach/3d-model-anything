@@ -1,0 +1,85 @@
+name: Build Android app
+on:
+  push:
+    paths: ['apps/house-capture-android/**', '.github/workflows/android.yml']
+  pull_request:
+    paths: ['apps/house-capture-android/**', '.github/workflows/android.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/house-capture-android
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      # Validates the committed wrapper JAR before any Gradle task runs.
+      - uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+      - run: ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
+      - name: Verify release manifest
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          manifests = list(Path("app/build/intermediates/merged_manifests/release").rglob("AndroidManifest.xml"))
+          if len(manifests) != 1:
+              raise SystemExit(f"Expected one merged release manifest, found {len(manifests)}")
+          manifest = ET.parse(manifests[0]).getroot()
+          android = "{http://schemas.android.com/apk/res/android}"
+          if any(e.tag.startswith("uses-permission") and e.get(android + "name") == "android.permission.INTERNET"
+                 for e in manifest):
+              raise SystemExit("Release must not request INTERNET")
+          application = manifest.find("application")
+          if application is None:
+              raise SystemExit("Release application element is missing")
+          if application.get(android + "debuggable") not in (None, "false"):
+              raise SystemExit("Release must not be debuggable")
+          if application.get(android + "allowBackup") != "false":
+              raise SystemExit("Release must disable Android backup")
+          if application.get(android + "dataExtractionRules") != "@xml/data_extraction_rules":
+              raise SystemExit("Release must keep the explicit backup/transfer exclusions")
+          if any(e.get(android + "name") == "androidx.compose.ui.tooling.PreviewActivity"
+                 or e.get(android + "targetActivity") == "androidx.compose.ui.tooling.PreviewActivity"
+                 for e in application):
+              raise SystemExit("Release must not expose Compose PreviewActivity")
+          providers = [p for p in application.findall("provider")
+                       if p.get(android + "name") == "androidx.core.content.FileProvider"]
+          if len(providers) != 1 or providers[0].get(android + "exported") != "false":
+              raise SystemExit("Release FileProvider must remain non-exported")
+          paths = [m.get(android + "resource") for m in providers[0].findall("meta-data")
+                   if m.get(android + "name") == "android.support.FILE_PROVIDER_PATHS"]
+          if paths != ["@xml/file_paths"]:
+              raise SystemExit("Release FileProvider must use the reviewed path resource")
+          path_rules = list(ET.parse("app/src/main/res/xml/file_paths.xml").getroot())
+          if len(path_rules) != 1 or path_rules[0].tag != "cache-path" or path_rules[0].get("path") != "share/":
+              raise SystemExit("FileProvider must be scoped to cache/share only")
+          print(f"Release manifest passed: {manifests[0]}")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: house-capture-android-debug
+          path: apps/house-capture-android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: house-capture-android-unsigned-release
+          path: apps/house-capture-android/app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: house-capture-android-test-reports
+          path: |
+            apps/house-capture-android/app/build/reports/tests/
+            apps/house-capture-android/app/build/test-results/testDebugUnitTest/
+          if-no-files-found: error

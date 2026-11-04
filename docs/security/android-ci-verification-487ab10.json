@@ -1,0 +1,149 @@
+{
+  "commit": "487ab106b7a74321ad9f2624e2814c05ebb93ad7",
+  "run_id": 41718306576,
+  "artifacts": [
+    {
+      "kind": "release",
+      "archive_sha256": "bc99c43057ca0d5c165319d637c65f7b6bb4358739765e933dbe9b7bd645f7c3",
+      "apk_sha256": "c29838e7de44d0f501e5090e08fcf9e81104b798de429eaf3c1fbdaf53d5a88a",
+      "apk_bytes": 43357324
+    },
+    {
+      "kind": "tests",
+      "archive_sha256": "acbde7828180ff947e4d502fe67abf202537430d366bc9f7e39be06389cad1f8",
+      "suites": [
+        {
+          "name": "com.wesbos.housecapture.BundleFormatTest",
+          "tests": "10",
+          "failures": "0",
+          "errors": "0",
+          "skipped": "0"
+        },
+        {
+          "name": "com.wesbos.housecapture.DepthPairingTest",
+          "tests": "10",
+          "failures": "0",
+          "errors": "0",
+          "skipped": "0"
+        },
+        {
+          "name": "com.wesbos.housecapture.ScanSummaryTest",
+          "tests": "10",
+          "failures": "0",
+          "errors": "0",
+          "skipped": "0"
+        },
+        {
+          "name": "com.wesbos.housecapture.SessionFilesTest",
+          "tests": "11",
+          "failures": "0",
+          "errors": "0",
+          "skipped": "0"
+        }
+      ],
+      "totals": {
+        "tests": 41,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      }
+    }
+  ],
+  "workflow_url": "https://github.com/HunterGerlach/3d-model-anything/actions/runs/41718306576",
+  "build_result": "success",
+  "apk_execution": "not installed or executed",
+  "release_manifest": {
+    "permissions": [
+      "android.permission.CAMERA",
+      "com.wesbos.housecapture.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+    ],
+    "debuggable": false,
+    "allowBackup": false,
+    "dataExtractionRules": {
+      "type": 1,
+      "data": "0x7f0e0000"
+    },
+    "activities": [
+      {
+        "android:name": "com.wesbos.housecapture.MainActivity",
+        "android:exported": true,
+        "android:screenOrientation": 1,
+        "android:configChanges": 1440
+      },
+      {
+        "android:theme": {
+          "type": 1,
+          "data": "0x103023a"
+        },
+        "android:name": "com.google.ar.core.InstallActivity",
+        "android:exported": false,
+        "android:excludeFromRecents": true,
+        "android:launchMode": 1,
+        "android:configChanges": 1184
+      }
+    ],
+    "providers": [
+      {
+        "android:name": "androidx.core.content.FileProvider",
+        "android:exported": false,
+        "android:authorities": "com.wesbos.housecapture.files",
+        "android:grantUriPermissions": true
+      },
+      {
+        "android:name": "androidx.startup.InitializationProvider",
+        "android:exported": false,
+        "android:authorities": "com.wesbos.housecapture.androidx-startup"
+      }
+    ]
+  },
+  "compiled_xml_resources": {
+    "res/4j.xml": [
+      {
+        "element": "data-extraction-rules",
+        "path": "data-extraction-rules",
+        "attributes": {}
+      },
+      {
+        "element": "cloud-backup",
+        "path": "data-extraction-rules/cloud-backup",
+        "attributes": {}
+      },
+      {
+        "element": "exclude",
+        "path": "data-extraction-rules/cloud-backup/exclude",
+        "attributes": {
+          "domain": "file",
+          "path": "."
+        }
+      },
+      {
+        "element": "device-transfer",
+        "path": "data-extraction-rules/device-transfer",
+        "attributes": {}
+      },
+      {
+        "element": "exclude",
+        "path": "data-extraction-rules/device-transfer/exclude",
+        "attributes": {
+          "domain": "file",
+          "path": "."
+        }
+      }
+    ],
+    "res/8K.xml": [
+      {
+        "element": "paths",
+        "path": "paths",
+        "attributes": {}
+      },
+      {
+        "element": "cache-path",
+        "path": "paths/cache-path",
+        "attributes": {
+          "name": "share",
+          "path": "share/"
+        }
+      }
+    ]
+  }
+}
