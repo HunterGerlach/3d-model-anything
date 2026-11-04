@@ -74,11 +74,19 @@ jobs:
           preview_dir=app/build/outputs/apk/preview
           build_tools="$ANDROID_HOME/build-tools/35.0.0"
           mkdir -p "$preview_dir"
-          # assembleDebug creates a fresh runner-local test key. Never publish or cache it.
+          # Generate an isolated temporary signing key; never publish or cache it.
+          umask 077
+          preview_key_dir=$(mktemp -d "$RUNNER_TEMP/house-capture-preview-key.XXXXXX")
+          trap 'rm -rf -- "$preview_key_dir"' EXIT
+          "$JAVA_HOME/bin/keytool" -genkeypair -noprompt \
+            -keystore "$preview_key_dir/preview.p12" -storetype PKCS12 \
+            -alias preview -keyalg RSA -keysize 3072 -sigalg SHA256withRSA \
+            -validity 3650 -dname "CN=3D Model Anything Preview" \
+            -storepass android -keypass android
           # Signing the release APK retains its non-debuggable manifest and dependencies.
           "$build_tools/apksigner" sign \
-            --ks "$HOME/.android/debug.keystore" \
-            --ks-key-alias androiddebugkey \
+            --ks "$preview_key_dir/preview.p12" \
+            --ks-key-alias preview \
             --ks-pass pass:android --key-pass pass:android \
             --v4-signing-enabled false \
             --out "$preview_dir/house-capture-preview.apk" \
@@ -88,13 +96,13 @@ jobs:
           cat "$preview_dir/signature.txt"
           (cd "$preview_dir" && sha256sum house-capture-preview.apk > SHA256SUMS)
           cat > "$preview_dir/INSTALL.txt" <<'TEXT'
-          House Capture - installable Android preview
+          3D Model Anything - installable Android preview
 
           1. Download house-capture-android-preview from this GitHub Actions run while signed in.
           2. On your phone, open Files > Downloads, select the ZIP, and tap Extract.
           3. Open house-capture-preview.apk. If prompted, tap Settings and allow installs
              from the app opening the file, then return and tap Install.
-          4. Open House Capture and allow camera access while using the app.
+          4. Open 3D Model Anything; allow camera access when starting a scan.
 
           This is a release-mode APK signed with a temporary test key. App debugging
           remains disabled. The private signing key is not included or retained.
